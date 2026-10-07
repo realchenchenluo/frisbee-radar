@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -311,6 +312,53 @@ class TestSkipIfUnchanged(unittest.TestCase):
         )
         self.assertFalse(info["unchanged"])
         json.loads((self.out / "data.json").read_text(encoding="utf-8"))
+
+
+class TestFallbackLink(unittest.TestCase):
+    """公众号链接会过期，得给个「找回来」的入口。
+
+    实测：搜狗给的跳转地址带 `timestamp`+`signature`，采后约 4 小时还能开，
+    两天后就不是文章页了。永久链接（`__biz=..&sn=..`）拿不到 ——
+    sn 在 HTML 里是空的、由 JS 填，而且真浏览器打开时 `window.sn` 也是空。
+    所以退一步：给一个按标题搜索的链接。
+    """
+
+    def setUp(self):
+        self.clf = CategoryClassifier([TRAINING, TEAM])
+
+    def test_wechat_items_get_a_search_fallback(self):
+        payload = build_payload(
+            [make_post("a", title="飞盘教学课", platform="wechat",
+                       author="某飞盘号")], self.clf,
+        )
+        fallback = payload["items"][0]["fallbackUrl"]
+        self.assertTrue(fallback)
+        self.assertIn("weixin.sogou.com", fallback)
+        # 查询词要带上标题，否则搜不到
+        self.assertIn("飞盘", unquote(fallback))
+
+    def test_other_platforms_have_no_fallback(self):
+        """小红书链接实测没有过期问题，不用加这个入口。"""
+        payload = build_payload(
+            [make_post("b", title="飞盘教学课", platform="xiaohongshu")], self.clf
+        )
+        self.assertEqual(payload["items"][0]["fallbackUrl"], "")
+
+    def test_fallback_empty_without_title(self):
+        payload = build_payload(
+            [make_post("c", title="飞盘教学课", platform="wechat")], self.clf
+        )
+        # 标题为空时不该拼出个没意义的搜索链接
+        posts = [make_post("d", title="", platform="wechat")]
+        payload = build_payload(posts, self.clf)
+        for item in payload["items"]:
+            self.assertEqual(item["fallbackUrl"], "")
+
+    def test_page_renders_the_fallback_link(self):
+        payload = build_payload([], CategoryClassifier([TRAINING]))
+        page = build_index_html("x", payload)
+        self.assertIn("fallbackUrl", page)
+        self.assertIn("链接打不开", page)
 
 
 class TestShippedPublishConfig(unittest.TestCase):

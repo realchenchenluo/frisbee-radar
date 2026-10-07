@@ -48,6 +48,7 @@ import json
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from .categories import CategoryClassifier
 from .models import Post, platform_label
@@ -72,6 +73,26 @@ def _iso(dt: datetime | None) -> str:
     if dt is None:
         return ""
     return dt.astimezone(timezone(timedelta(hours=8))).isoformat()
+
+
+def _fallback_url(platform: str, title: str, author: str) -> str:
+    """给可能会失效的链接准备一个「找回来」的入口。
+
+    ⚠️ 微信公众号的链接是**会过期的**，这是搜狗这条路的固有限制：
+    搜狗给的跳转地址形如 `mp.weixin.qq.com/s?src=11&timestamp=..&signature=..`，
+    签名有时间窗。实测采后约 4 小时还能打开，两天后就不是文章页了。
+
+    本来想存「永久链接」（`__biz=..&mid=..&idx=..&sn=..`），但拿不到：
+    sn 在 HTML 里是空的、由 JS 运行时填，而实测即使真浏览器打开，
+    `window.sn` 依然是空字符串 —— 从搜狗签名链接进来的文章页不设置它。
+
+    所以退一步：给一个按标题搜索的链接。链接死了，读者还能一键找回原文。
+    小红书那边暂时没发现这个问题（链接里带 xsec_token，实测几小时内正常）。
+    """
+    if platform != "wechat" or not title:
+        return ""
+    query = quote(f"{title} {author}".strip()[:60])
+    return f"https://weixin.sogou.com/weixin?type=2&query={query}"
 
 
 def build_payload(
@@ -107,6 +128,7 @@ def build_payload(
                 "iso": _iso(post.publish_time),
                 "excerpt": _excerpt(post.content if post.content != post.title else ""),
                 "url": post.url,
+                "fallbackUrl": _fallback_url(post.platform, post.title, post.author),
                 "metric": value,
                 "metricLabel": metric_label,
                 "relevance": round(post.relevance, 2),
@@ -223,6 +245,9 @@ main {{ padding: 18px 20px 60px; }}
 .excerpt {{ margin: 0 0 9px; color: var(--ink-soft); font-size: 13.5px; }}
 .open {{ font-size: 13px; text-decoration: none; }}
 .open:hover {{ text-decoration: underline; }}
+/* 公众号链接会过期（搜狗签名有时间窗），给个搜索兜底入口 */
+.fallback {{ font-size: 12.5px; color: var(--ink-faint); text-decoration: none; margin-left: 14px; }}
+.fallback:hover {{ color: var(--accent-dark); text-decoration: underline; }}
 
 .empty {{ text-align: center; color: var(--ink-faint); padding: 50px 20px; }}
 footer.site {{
@@ -308,6 +333,7 @@ function render() {{
       </div>
       ${{it.excerpt ? `<p class="excerpt">${{escapeHtml(it.excerpt)}}</p>` : ""}}
       <a class="open" href="${{it.url}}" target="_blank" rel="noopener noreferrer">打开原文 →</a>
+      ${{it.fallbackUrl ? `<a class="fallback" href="${{it.fallbackUrl}}" target="_blank" rel="noopener noreferrer">链接打不开？按标题搜 →</a>` : ""}}
     </article>`).join("");
 }}
 
