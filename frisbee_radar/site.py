@@ -43,6 +43,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import json
 import shutil
 from datetime import datetime, timedelta, timezone
@@ -385,6 +386,20 @@ def build_index_html(title: str, payload: dict) -> str:
     )
 
 
+def content_signature(payload: dict) -> str:
+    """内容指纹：忽略 generatedAt，只看真实内容。
+
+    用途是判断「这次生成跟上次有没有区别」。区别只在时间戳上时，
+    不该重写文件、不该产生提交、更不该把网站的「最近更新」刷新掉 ——
+    那会让人以为有新内容，而实际上什么都没有。
+
+    用户明确要求过：没有新内容就保留原来的，不要假装更新过。
+    """
+    meaningful = {k: v for k, v in payload.items() if k != "generatedAt"}
+    blob = json.dumps(meaningful, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+
 def generate_site(
     posts: list[Post],
     out_dir: Path,
@@ -393,15 +408,39 @@ def generate_site(
     title: str = "飞盘讯息聚合",
     generated_at: datetime | None = None,
     keep_history: bool = True,
+    skip_if_unchanged: bool = False,
 ) -> dict:
-    """生成静态站到 out_dir。返回站点信息（含 payload 概要）。
+    """生成静态站到 out_dir。
+
+    skip_if_unchanged=True 时，先比内容指纹：和现有 data.json 一致就直接
+    返回，什么都不写。定时任务用这个模式，避免"没内容也刷新一遍"。
 
     keep_history=True 时会把本次数据也存一份到 archive/ 下，
     这样即使后面某次采集结果变少，历史页面也还在。
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
     payload = build_payload(posts, classifier, generated_at=generated_at)
 
+    existing = out_dir / "data.json"
+    if skip_if_unchanged and existing.exists():
+        try:
+            old = json.loads(existing.read_text(encoding="utf-8"))
+            if content_signature(old) == content_signature(payload):
+                return {
+                    "out_dir": out_dir,
+                    "unchanged": True,
+                    "total": old.get("total", 0),
+                    "generatedDate": old.get("generatedDate", ""),
+                    "latestDate": old.get("latestDate", ""),
+                    "categories": {
+                        c["label"]: c["count"] for c in old.get("categories", [])
+                    },
+                    "platforms": old.get("platforms", {}),
+                }
+        except Exception:
+            # 旧的 data.json 坏了就照常重写，不要因为这个卡住发布
+            pass
+
+    out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "data.json").write_text(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",
@@ -422,6 +461,7 @@ def generate_site(
 
     return {
         "out_dir": out_dir,
+        "unchanged": False,
         "total": payload["total"],
         "generatedDate": payload["generatedDate"],
         "latestDate": payload["latestDate"],

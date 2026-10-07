@@ -637,7 +637,13 @@ def do_publish(args: argparse.Namespace, config: AppConfig) -> int:
         site_info = generate_site(
             posts, out_dir, config.build_classifier(),
             title=config.publish.title,
+            skip_if_unchanged=bool(args.if_changed),
         )
+
+    if site_info.get("unchanged"):
+        ok("内容和上次一致，保留原有网页（不重写文件、不刷新时间、不提交）")
+        info(f"  当前收录 {site_info['total']} 条，内容最新到 {site_info['latestDate'] or '—'}")
+        return 0
 
     ok(f"网页已生成：{out_dir}")
     info(f"  收录 {site_info['total']} 条　"
@@ -709,6 +715,50 @@ def do_publish(args: argparse.Namespace, config: AppConfig) -> int:
         info("   https://<用户名>.github.io/<仓库名>/")
     info("若显示 404：去仓库 Settings → Pages，把 Source 选成 main 分支的 /docs（只需设置一次）")
     return 0
+
+
+# --------------------------------------------------------------------- daily
+
+
+async def do_daily(args: argparse.Namespace, config: AppConfig) -> int:
+    """定时任务的入口：采集 → 判断 → 出日报 → 更新网页 → 推送。
+
+    **核心原则（用户明确要求）：没有新内容就什么都不做。**
+
+      · 不写日报文件
+      · 不重写网页，不刷新「最近更新」时间
+      · 不产生 git 提交
+      · 绝不为了让页面"看起来有更新"而改动任何内容 ——
+        网页和日报里出现的每一条都来自实际采集，采集不到就是没有。
+
+    所以这个命令跑完可能是「什么都没做」，那是正常结果，日志里会写明原因。
+    """
+    started = datetime.now()
+    header(f"每日自动更新　{started.strftime('%Y-%m-%d %H:%M')}")
+
+    # 1) 采集 + 判断要不要出日报（复用 watch 的全部逻辑）
+    watch_args = argparse.Namespace(
+        source=args.source,
+        no_crawl=args.no_crawl,
+        force=args.force,
+        min_relevance=args.min_relevance,
+        output=None,
+        db=args.db,
+    )
+    crawl_code = await do_watch(watch_args, config)
+
+    # 2) 更新网页。用 --if-changed：内容和上次一致就一个字节都不写。
+    #    注意这一步和"要不要出日报"是独立的 —— 就算没达到出日报的阈值，
+    #    只要库里有新内容，网页也该更新。
+    info("")
+    publish_args = argparse.Namespace(
+        out=None, push=args.push, if_changed=True, db=args.db,
+    )
+    publish_code = do_publish(publish_args, config)
+
+    elapsed = int((datetime.now() - started).total_seconds())
+    header(f"本次结束（耗时 {elapsed} 秒）")
+    return crawl_code or publish_code
 
 
 # ------------------------------------------------------------------- targets
@@ -1046,7 +1096,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_publish.add_argument("--out", help="输出目录（默认取配置的 publish.dir）")
     p_publish.add_argument("--push", action="store_true",
                           help="提交并推送到 GitHub（推送前会做敏感文件检查）")
+    p_publish.add_argument("--if-changed", action="store_true",
+                          help="内容没变就什么都不做（定时任务用这个，"
+                               "避免没新内容也刷新一遍）")
     p_publish.add_argument("--db", help="指定数据库文件")
+
+    p_daily = sub.add_parser(
+        "daily",
+        help="每日自动更新：采集 → 判断 → 出日报 → 更新网页 → 推送",
+        description="定时任务调用的就是这条。原则：**没有新内容就什么都不做** ——"
+                    "不写日报、不重写网页、不刷新时间戳、不产生提交。",
+    )
+    p_daily.add_argument("--push", action="store_true", help="更新后推送到 GitHub")
+    p_daily.add_argument("--force", action="store_true",
+                         help="无视阈值，强制出一份日报（网页仍只在内容变化时更新）")
+    p_daily.add_argument("--source", choices=AVAILABLE, help="只跑某个平台")
+    p_daily.add_argument("--no-crawl", action="store_true",
+                         help="跳过采集，只按库里存量处理")
+    p_daily.add_argument("--min-relevance", type=float, default=0.5)
+    p_daily.add_argument("--db", help="指定数据库文件")
 
     return parser
 
@@ -1086,6 +1154,12 @@ def main(argv: list[str] | None = None) -> int:
             return 130
     if args.command == "publish":
         return do_publish(args, config)
+    if args.command == "daily":
+        try:
+            return asyncio.run(do_daily(args, config))
+        except KeyboardInterrupt:
+            warn("已中断。")
+            return 130
     if args.command == "watch":
         try:
             return asyncio.run(do_watch(args, config))

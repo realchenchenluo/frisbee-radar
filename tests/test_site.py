@@ -230,6 +230,89 @@ class TestGenerateSite(unittest.TestCase):
         self.assertTrue((self.out / "index.html").exists())
 
 
+class TestSkipIfUnchanged(unittest.TestCase):
+    """没有新内容就什么都不做。
+
+    用户明确要求过：「有新的内容就更新，没有就保留原来的」。
+    这条护栏对应的是：定时任务每天跑，但没新内容时不能重写文件、
+    不能刷新「最近更新」时间、不能产生 git 提交 ——
+    否则网页上会显示"刚刚更新"，而实际上什么都没有，等于骗读者。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self.tmp.name) / "docs"
+        self.clf = CategoryClassifier([TRAINING, TEAM])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_signature_ignores_generated_at(self):
+        from frisbee_radar.site import content_signature
+
+        a = {"total": 3, "generatedAt": "2026-10-07 19:00", "items": []}
+        b = {"total": 3, "generatedAt": "2026-10-08 21:00", "items": []}
+        self.assertEqual(content_signature(a), content_signature(b))
+
+    def test_signature_changes_when_content_changes(self):
+        from frisbee_radar.site import content_signature
+
+        a = {"total": 3, "generatedAt": "x", "items": []}
+        b = {"total": 4, "generatedAt": "x", "items": []}
+        self.assertNotEqual(content_signature(a), content_signature(b))
+
+    def test_signature_changes_when_item_changes(self):
+        from frisbee_radar.site import content_signature
+
+        a = {"generatedAt": "x", "items": [{"title": "飞盘教学"}]}
+        b = {"generatedAt": "x", "items": [{"title": "飞盘教学（新版）"}]}
+        self.assertNotEqual(content_signature(a), content_signature(b))
+
+    def test_second_run_with_same_data_writes_nothing(self):
+        posts = [make_post("a", title="飞盘教学课")]
+        generate_site(posts, self.out, self.clf)
+        before = (self.out / "data.json").stat().st_mtime_ns
+
+        info = generate_site(posts, self.out, self.clf, skip_if_unchanged=True)
+
+        self.assertTrue(info["unchanged"])
+        self.assertEqual((self.out / "data.json").stat().st_mtime_ns, before,
+                         "内容没变却重写了文件 —— 定时任务会因此产生假更新")
+
+    def test_second_run_reports_existing_counts(self):
+        posts = [make_post("a", title="飞盘教学课")]
+        generate_site(posts, self.out, self.clf)
+        info = generate_site(posts, self.out, self.clf, skip_if_unchanged=True)
+        self.assertEqual(info["total"], 1)
+        self.assertIn("训练与技巧", info["categories"])
+
+    def test_new_content_does_write(self):
+        generate_site([make_post("a", title="飞盘教学 A")], self.out, self.clf)
+        info = generate_site(
+            [make_post("a", title="飞盘教学 A"), make_post("b", title="飞盘教学 B")],
+            self.out, self.clf, skip_if_unchanged=True,
+        )
+        self.assertFalse(info["unchanged"])
+        self.assertEqual(info["total"], 2)
+
+    def test_default_always_writes(self):
+        """手动发布（不带 --if-changed）仍然照常重写，行为不变。"""
+        posts = [make_post("a", title="飞盘教学课")]
+        generate_site(posts, self.out, self.clf)
+        info = generate_site(posts, self.out, self.clf)
+        self.assertFalse(info["unchanged"])
+
+    def test_corrupt_existing_data_does_not_block_publishing(self):
+        """旧的 data.json 坏掉时要照常重写，不能因为读不了就卡住。"""
+        generate_site([make_post("a", title="飞盘教学课")], self.out, self.clf)
+        (self.out / "data.json").write_text("{ 这不是合法 JSON", encoding="utf-8")
+        info = generate_site(
+            [make_post("a", title="飞盘教学课")], self.out, self.clf, skip_if_unchanged=True
+        )
+        self.assertFalse(info["unchanged"])
+        json.loads((self.out / "data.json").read_text(encoding="utf-8"))
+
+
 class TestShippedPublishConfig(unittest.TestCase):
     def test_defaults_point_at_docs(self):
         """GitHub Pages 要指到 /docs，配错了网页就是 404。"""
