@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import json
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -633,16 +634,27 @@ def _deploy_cloudflare(project: str, out_dir: Path, root: Path) -> bool:
     """
     info("")
     info(f"部署到 Cloudflare Pages（项目 {project}）…")
+
+    # ⚠️ Windows 上 npx 实际是 npx.cmd。subprocess 不走 shell 时按 PATH 找
+    # 不到 .cmd（PATHEXT 那套是 shell 的机制），会直接 FileNotFoundError ——
+    # 表现就是"找不到 npx"，而 npx 明明装着。所以先用 shutil.which 把真实
+    # 路径解析出来。
+    npx = shutil.which("npx") or shutil.which("npx.cmd")
+    if not npx:
+        warn("找不到 npx —— 需要 Node.js 才能部署 Cloudflare。")
+        info("  安装 Node.js 后重试。")
+        info(f"  浏览器里访问 https://{project}.pages.dev/ 仍可正常看（上次部署的内容）")
+        return False
+
     try:
         result = subprocess.run(
-            ["npx", "--yes", "wrangler@latest", "pages", "deploy", str(out_dir),
+            [npx, "--yes", "wrangler@latest", "pages", "deploy", str(out_dir),
              "--project-name", project, "--branch", "main", "--commit-dirty=true"],
             cwd=str(root), capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=600, shell=False,
         )
     except FileNotFoundError:
-        warn("找不到 npx —— 需要 Node.js 才能部署 Cloudflare。")
-        info("  浏览器里访问 https://feipannews.pages.dev/ 仍可正常看（上次部署的内容）")
+        warn(f"npx 解析到了 {npx} 但执行不了，跳过 Cloudflare 部署。")
         return False
     except subprocess.TimeoutExpired:
         warn("部署超时（超过 10 分钟），跳过。")
@@ -889,20 +901,40 @@ def _domain_ready_for_pages(
     return False, f"{domain} 解析不出任何地址", None
 
 
-def do_domain(args: argparse.Namespace, config: AppConfig) -> int:
+def _gh_set_pages_domain(repo: str, domain: str) -> tuple[bool, str]:
+    """在 GitHub Pages 上登记自定义域名。
+
+    抽成独立函数是为了能在测试里替换掉 —— 否则测试会真的去改线上配置。
+    （写这个函数之前踩过：测试只 mock 了 DNS，git/gh 却是真的，
+      结果测试在真仓库上产生了提交。）
+    """
+    result = subprocess.run(
+        ["gh", "api", "-X", "PUT", f"repos/{repo}/pages",
+         "-f", f"cname={domain}", "-f", "https_enforced=true"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    return result.returncode == 0, (result.stderr or result.stdout or "").strip()
+
+
+def do_domain(
+    args: argparse.Namespace, config: AppConfig, *, root: Path | None = None
+) -> int:
     """给静态站绑自定义域名（或解绑）。
 
     ⚠️ 顺序很重要，搞反会让网站暂时打不开：
-       1. **先在域名商那里加 DNS 记录**（CNAME 指向 <用户名>.github.io）
+       1. **先在域名商那里加 DNS 记录**（指向 GitHub Pages）
        2. 等它生效（几分钟到几小时）
        3. 再运行本命令把域名告诉 GitHub Pages
 
     一旦 GitHub Pages 认了自定义域名，原来的 <用户名>.github.io/<仓库>/
     会自动 301 跳到新域名 —— 所以 DNS 没生效就设置，等于把两个地址
     都弄成打不开。
+
+    root 可注入：测试会传一个临时目录，避免碰到真仓库。
     """
     repo = args.repo or "realchenchenluo/frisbee-radar"
     out_dir = config.publish.resolve_dir()
+    root = root or PROJECT_ROOT
 
     if args.clear:
         header("解绑自定义域名")
@@ -959,7 +991,6 @@ def do_domain(args: argparse.Namespace, config: AppConfig) -> int:
     ok(f"DNS 就绪：{detail}")
 
     # ---- 写 CNAME 文件并推送（GitHub Pages 认这个文件）----
-    root = PROJECT_ROOT
     cname_file = out_dir / "CNAME"
     cname_file.write_text(domain + "\n", encoding="utf-8")
     info(f"已写入 {cname_file}")
@@ -968,29 +999,34 @@ def do_domain(args: argparse.Namespace, config: AppConfig) -> int:
         try:
             rel_path = cname_file.relative_to(root)
         except ValueError:
-            # 输出目录被改到仓库外了（测试或自定义配置），那就只写文件不提交
-            warn("输出目录不在仓库里，CNAME 不会提交到 git —— 手动把它放到仓库内再推。")
+            # 输出目录不在传入的仓库根下（自定义配置），那就不提交
+            warn("输出目录不在仓库里，CNAME 不会提交到 git。")
             rel_path = None
-        if rel_path is not None:
-            _git(root, "add", str(rel_path))
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        _git(root, "commit", "-m", f"绑定自定义域名 {domain}（{stamp}）")
-        push = _git(root, "push", "origin", config.publish.branch)
-        if push.returncode == 0:
-            ok("CNAME 已推送")
+
+        if rel_path is None:
+            pass
         else:
-            warn(f"推送失败：{(push.stderr or push.stdout).strip()[:200]}")
+            _git(root, "add", str(rel_path))
+            staged = _git(root, "diff", "--cached", "--name-only")
+            if (staged.stdout or "").strip():
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                _git(root, "commit", "-m", f"绑定自定义域名 {domain}（{stamp}）")
+                push = _git(root, "push", "origin", config.publish.branch)
+                if push.returncode == 0:
+                    ok("CNAME 已推送")
+                else:
+                    warn(f"推送失败：{(push.stderr or push.stdout).strip()[:200]}")
+            else:
+                info("CNAME 内容没变化，跳过提交。")
 
     # ---- 在 GitHub Pages 上登记域名 ----
-    result = subprocess.run(
-        ["gh", "api", "-X", "PUT", f"repos/{repo}/pages",
-         "-f", f"cname={domain}", "-f", "https_enforced=true"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
-    if result.returncode != 0:
+    registered, message = _gh_set_pages_domain(repo, domain)
+    if not registered:
         warn("通过 API 登记域名没成功，去仓库 Settings → Pages 手动填 Custom domain：")
         info(f"  https://github.com/{repo}/settings/pages")
         info(f"  Custom domain 填：{domain}")
+        if message:
+            info(f"  （原始错误：{message[:160]}）")
     else:
         ok("已在 GitHub Pages 登记")
 

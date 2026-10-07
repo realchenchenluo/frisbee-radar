@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -142,7 +143,12 @@ class TestRefusesWhenDnsNotReady(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.out = Path(self.tmp.name) / "docs"
+        # 造一个隔离的「仓库根」，里面有 docs/ —— 全部操作都关在这里面。
+        # ⚠️ 这一步至关重要：早先这个测试只 mock 了 DNS，git/gh 却是真的，
+        # 结果测试在真仓库上产生了提交（提交信息写"绑定自定义域名"，
+        # 内容却是别的东西），还差点改了线上 Pages 配置。
+        self.root = Path(self.tmp.name)
+        self.out = self.root / "docs"
         self.out.mkdir(parents=True)
         self.config = load_config()
         object.__setattr__(self.config.publish, "dir", str(self.out))
@@ -154,8 +160,10 @@ class TestRefusesWhenDnsNotReady(unittest.TestCase):
         args = argparse.Namespace(domain=domain, clear=clear, repo=None, out=None)
         with mock.patch(
             "frisbee_radar.cli._resolve_domain", fake_resolver(addresses, cname)
+        ), mock.patch(
+            "frisbee_radar.cli._gh_set_pages_domain", lambda repo, d: (True, "")
         ):
-            return do_domain(args, self.config)
+            return do_domain(args, self.config, root=self.root)
 
     def test_returns_error_and_writes_no_cname(self):
         code = self._run("feipan.info", addresses=["192.168.8.1"])   # 劫持
@@ -180,6 +188,34 @@ class TestRefusesWhenDnsNotReady(unittest.TestCase):
         self.assertEqual(
             (self.out / "CNAME").read_text(encoding="utf-8").strip(), "feipan.info"
         )
+
+    def test_does_not_touch_the_real_repo(self):
+        """★ 护栏：测试不许在真实项目目录里留下任何东西。
+
+        这是上一版测试捅的篓子 —— 只 mock DNS 不 mock git，
+        测试跑完在真仓库里多了一条提交。
+        """
+        from frisbee_radar.config import PROJECT_ROOT
+
+        before = sorted(p.name for p in PROJECT_ROOT.iterdir())
+        log_before = subprocess.run(
+            ["git", "log", "--oneline"], cwd=str(PROJECT_ROOT),
+            capture_output=True, text=True,
+        ).stdout
+
+        self._run("feipan.info", cname=PAGES_TARGET)          # 会走完整流程
+        self._run("feipan.info", addresses=["192.168.8.1"])    # 会被拒
+        self._run("", clear=True)                              # 解绑分支
+
+        self.assertEqual(
+            sorted(p.name for p in PROJECT_ROOT.iterdir()), before,
+            "测试在真实项目目录里留下了文件",
+        )
+        log_after = subprocess.run(
+            ["git", "log", "--oneline"], cwd=str(PROJECT_ROOT),
+            capture_output=True, text=True,
+        ).stdout
+        self.assertEqual(log_after, log_before, "测试在真实仓库里产生了提交")
 
 
 class TestDomainCommandRegistered(unittest.TestCase):
