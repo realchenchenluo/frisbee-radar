@@ -596,6 +596,27 @@ def _assert_git_safe(root: Path) -> list[str]:
     return problems
 
 
+def _pages_url(root: Path) -> str:
+    """从 git remote 推出 GitHub Pages 网址。
+
+    规则：https://<用户>.github.io/<仓库>/
+    仓库名以 .github.io 结尾的话（用户主页仓库）网址就是 https://<用户>.github.io/
+    """
+    import re
+
+    remote = _git(root, "remote", "get-url", "origin")
+    url = (remote.stdout or "").strip()
+    if not url:
+        return ""
+    m = re.search(r"github\.com[:/]([^/]+)/([^/\s]+?)(?:\.git)?$", url)
+    if not m:
+        return ""
+    owner, repo = m.group(1), m.group(2)
+    if repo.lower() == f"{owner.lower()}.github.io":
+        return f"https://{owner}.github.io/"
+    return f"https://{owner}.github.io/{repo}/"
+
+
 def do_publish(args: argparse.Namespace, config: AppConfig) -> int:
     """把库里的内容生成静态网页；--push 时提交并推送到 GitHub。"""
     db = resolve_db(config, args)
@@ -679,10 +700,14 @@ def do_publish(args: argparse.Namespace, config: AppConfig) -> int:
         ok(f"已推送到 origin/{config.publish.branch}")
 
     info("")
-    info("GitHub Pages 会在 1~2 分钟内更新。网址形如：")
-    info("   https://<你的用户名>.github.io/<仓库名>/")
-    info("（Pages 需要在仓库 Settings → Pages 里把 Source 选成 main 分支的 /docs 目录，")
-    info("  只需设置一次）")
+    url = _pages_url(root)
+    if url:
+        info(f"网页地址：{url}")
+        info("（GitHub Pages 需要 1~2 分钟构建，稍等再刷新）")
+    else:
+        info("GitHub Pages 会在 1~2 分钟内更新，网址形如：")
+        info("   https://<用户名>.github.io/<仓库名>/")
+    info("若显示 404：去仓库 Settings → Pages，把 Source 选成 main 分支的 /docs（只需设置一次）")
     return 0
 
 
