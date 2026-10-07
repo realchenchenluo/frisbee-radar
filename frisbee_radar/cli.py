@@ -950,6 +950,21 @@ def _domain_ready_for_pages(
     return False, f"{domain} 解析不出任何地址", None
 
 
+def _gh_clear_pages_domain(repo: str) -> tuple[bool, str]:
+    """清除 GitHub Pages 的自定义域名。
+
+    ⚠️ 这里**不能**用 `DELETE /repos/{repo}/pages` —— 那是**把整个
+    Pages 站点删掉**，不是清除域名。实测踩过：测试里未 mock 的解绑分支
+    跑了这条命令，直接把站点删了（has_pages 变成 false，两个地址全 404）。
+    正确做法是 PUT 一个空的 cname，只清域名、保留站点。
+    """
+    result = subprocess.run(
+        ["gh", "api", "-X", "PUT", f"repos/{repo}/pages", "-f", "cname="],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    return result.returncode == 0, (result.stderr or result.stdout or "").strip()
+
+
 def _gh_set_pages_domain(repo: str, domain: str) -> tuple[bool, str]:
     """在 GitHub Pages 上登记自定义域名。
 
@@ -987,19 +1002,26 @@ def do_domain(
 
     if args.clear:
         header("解绑自定义域名")
-        result = subprocess.run(
-            ["gh", "api", "-X", "DELETE", f"repos/{repo}/pages", "-f", "cname="],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-        )
+        # 只清域名，不删站点（原因见 _gh_clear_pages_domain 的注释）
+        cleared, message = _gh_clear_pages_domain(repo)
         cname_file = out_dir / "CNAME"
         if cname_file.exists():
             cname_file.unlink()
             info(f"已删除 {cname_file}")
-        if result.returncode == 0:
-            ok("已解绑，网站回到默认地址")
+            if _git(root, "rev-parse", "--is-inside-work-tree").returncode == 0:
+                try:
+                    _git(root, "rm", "--cached", "--ignore-unmatch",
+                         str(cname_file.relative_to(root)))
+                except ValueError:
+                    pass
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                _git(root, "commit", "-m", f"解绑自定义域名（{stamp}）")
+                _git(root, "push", "origin", config.publish.branch)
+        if cleared:
+            ok("已解绑自定义域名，网站仍在（回到默认地址）")
             info(f"  https://{repo.split('/')[0]}.github.io/{repo.split('/')[1]}/")
         else:
-            warn(f"解绑可能没成功：{(result.stderr or result.stdout).strip()[:200]}")
+            warn(f"解绑可能没成功：{message[:200]}")
             info("也可以去仓库 Settings → Pages 手动清除 Custom domain")
         return 0
 

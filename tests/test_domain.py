@@ -139,22 +139,36 @@ class TestResolveDomainInputValidation(unittest.TestCase):
 
 
 class TestRefusesWhenDnsNotReady(unittest.TestCase):
-    """DNS 没配好时必须拒绝，且不留任何痕迹。"""
+    """DNS 没配好时必须拒绝，且不留任何痕迹。
+
+    ⚠️ 这组测试的关键是**把所有副作用都封住**。
+
+    已经栽过两次，都是同一个原因：只 mock 了一部分，剩下的真跑了。
+      1. 第一版只 mock DNS，git/gh 是真的 → 测试在真仓库里产生了提交
+      2. 第二版补了 `_gh_set_pages_domain`，但漏了 --clear 分支里的
+         `gh api -X DELETE .../pages` → **测试把 GitHub Pages 站点删了**
+         （has_pages 变 false，两个地址全 404，得手工重新开启）
+
+    所以现在三道保险：mock 掉两个 gh 函数，**并且把 subprocess.run 整个
+    替换掉** —— 这样即使以后有人加了新的直接调用，测试也碰不到网络。
+    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        # 造一个隔离的「仓库根」，里面有 docs/ —— 全部操作都关在这里面。
-        # ⚠️ 这一步至关重要：早先这个测试只 mock 了 DNS，git/gh 却是真的，
-        # 结果测试在真仓库上产生了提交（提交信息写"绑定自定义域名"，
-        # 内容却是别的东西），还差点改了线上 Pages 配置。
         self.root = Path(self.tmp.name)
         self.out = self.root / "docs"
         self.out.mkdir(parents=True)
         self.config = load_config()
         object.__setattr__(self.config.publish, "dir", str(self.out))
+        self.external_calls: list[list] = []
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def _no_subprocess(self, cmd, *a, **kw):
+        """替换 subprocess.run：记录下来，但绝不真的执行。"""
+        self.external_calls.append(list(cmd) if isinstance(cmd, (list, tuple)) else [cmd])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
 
     def _run(self, domain, *, addresses=(), cname="", clear=False):
         args = argparse.Namespace(domain=domain, clear=clear, repo=None, out=None)
@@ -162,6 +176,10 @@ class TestRefusesWhenDnsNotReady(unittest.TestCase):
             "frisbee_radar.cli._resolve_domain", fake_resolver(addresses, cname)
         ), mock.patch(
             "frisbee_radar.cli._gh_set_pages_domain", lambda repo, d: (True, "")
+        ), mock.patch(
+            "frisbee_radar.cli._gh_clear_pages_domain", lambda repo: (True, "")
+        ), mock.patch(
+            "frisbee_radar.cli.subprocess.run", self._no_subprocess
         ):
             return do_domain(args, self.config, root=self.root)
 
@@ -189,12 +207,37 @@ class TestRefusesWhenDnsNotReady(unittest.TestCase):
             (self.out / "CNAME").read_text(encoding="utf-8").strip(), "feipan.info"
         )
 
-    def test_does_not_touch_the_real_repo(self):
-        """★ 护栏：测试不许在真实项目目录里留下任何东西。
+    def test_clear_never_deletes_the_pages_site(self):
+        """★ 解绑只能清域名，绝不能删站点。
 
-        这是上一版测试捅的篓子 —— 只 mock DNS 不 mock git，
-        测试跑完在真仓库里多了一条提交。
+        `DELETE /repos/{repo}/pages` 是**删除整个 Pages 站点**。
+        之前 --clear 就是用的它 —— 测试里跑到这条命令，站点真的被删了。
+        正确做法是 PUT 一个空 cname。
         """
+        from frisbee_radar.cli import _gh_clear_pages_domain
+
+        # 直接调真实实现，但让 subprocess 不执行
+        with mock.patch("frisbee_radar.cli.subprocess.run", self._no_subprocess):
+            _gh_clear_pages_domain("someone/somerepo")
+
+        self.assertTrue(self.external_calls, "没发出任何命令？")
+        cmd = self.external_calls[-1]
+        joined = " ".join(str(c) for c in cmd)
+        self.assertNotIn("DELETE", joined,
+                         "解绑用了 DELETE —— 那会连整个 Pages 站点一起删掉")
+        self.assertIn("PUT", joined)
+        self.assertIn("cname=", joined)
+
+    def test_no_external_command_escapes_during_clear(self):
+        """跑一遍 --clear，确认所有外部命令都只是被记录、没有真执行。"""
+        before = len(self.external_calls)
+        self._run("", clear=True)
+        for cmd in self.external_calls[before:]:
+            joined = " ".join(str(c) for c in cmd)
+            self.assertNotIn("DELETE", joined, f"测试泄露了删除操作：{joined}")
+
+    def test_does_not_touch_the_real_repo(self):
+        """★ 护栏：测试不许在真实项目目录里留下任何东西。"""
         from frisbee_radar.config import PROJECT_ROOT
 
         before = sorted(p.name for p in PROJECT_ROOT.iterdir())
