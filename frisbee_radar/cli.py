@@ -550,7 +550,7 @@ async def do_probe(args: argparse.Namespace, config: AppConfig) -> int:
 
 
 # 这些路径绝不能被提交到公开仓库 —— 里面是登录态和原始数据
-GIT_FORBIDDEN_PREFIXES = ("data/", "data\\")
+GIT_FORBIDDEN_PREFIXES = ("data/", "data\\", ".wrangler/", ".wrangler\\")
 GIT_FORBIDDEN_SUFFIXES = (".db", ".env", "cookies.json")
 GIT_MUST_IGNORE = (
     "data/browser_state",
@@ -558,6 +558,9 @@ GIT_MUST_IGNORE = (
     "data/mock.db",
     "data/login_debug",
     "data/probe",
+    # wrangler 的缓存里有 Cloudflare 账号 ID 和项目名。
+    # 不含凭据，但不该公开，而且每次部署都会变。
+    ".wrangler",
 )
 
 

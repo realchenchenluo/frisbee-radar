@@ -8,6 +8,11 @@ __pycache__/
 data/
 .scratch/
 
+# Cloudflare wrangler 的本地缓存。里面含账号 ID 和项目名，
+# 虽然不含凭据（token 存在仓库外的 %APPDATA%），但没必要公开，
+# 而且它会随每次部署变动，提交进去纯是噪音。
+.wrangler/
+
 # 编辑器
 .vscode/
 .idea/
