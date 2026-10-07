@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -717,6 +718,158 @@ def do_publish(args: argparse.Namespace, config: AppConfig) -> int:
     return 0
 
 
+# -------------------------------------------------------------------- domain
+
+
+# 域名的形状校验。必须先校验再交给 socket ——
+# 实测 socket.getaddrinfo("") 不报错，而是返回**本机**的地址
+# （172.x / 192.168.x / fe80::…），于是"DNS 查得到"这个判断会被误判成通过，
+# 护栏就失效了。空串、中文、带空格的输入都得在解析前挡掉。
+_DOMAIN_RE = re.compile(
+    r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+    r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$",
+    re.IGNORECASE,
+)
+
+
+def _dns_cname_targets(domain: str) -> list[str]:
+    """查一个域名的解析结果，用来判断 DNS 有没有配好。
+
+    只用标准库（socket / nslookup），不额外引依赖。
+    输入先过格式校验：不是合法域名就直接返回空，不去解析 ——
+    否则空串会解析出本机地址，让调用方误以为 DNS 已就绪。
+    """
+    import socket
+
+    domain = (domain or "").strip().lower()
+    if not _DOMAIN_RE.match(domain):
+        return []
+
+    found: list[str] = []
+    try:
+        infos = socket.getaddrinfo(domain, None)
+        found = sorted({i[4][0] for i in infos})
+    except Exception:
+        return []
+
+    # 再试着看 CNAME 具体指向哪（nslookup 输出解析，尽力而为）
+    try:
+        result = subprocess.run(
+            ["nslookup", "-type=CNAME", domain],
+            capture_output=True, text=True, timeout=15, encoding="utf-8", errors="replace",
+        )
+        for line in (result.stdout or "").splitlines():
+            if "canonical name" in line.lower() or "别名" in line:
+                target = line.split("=")[-1].strip().rstrip(".")
+                if target:
+                    found.append(f"CNAME → {target}")
+    except Exception:
+        pass
+
+    return found
+
+
+def do_domain(args: argparse.Namespace, config: AppConfig) -> int:
+    """给静态站绑自定义域名（或解绑）。
+
+    ⚠️ 顺序很重要，搞反会让网站暂时打不开：
+       1. **先在域名商那里加 DNS 记录**（CNAME 指向 <用户名>.github.io）
+       2. 等它生效（几分钟到几小时）
+       3. 再运行本命令把域名告诉 GitHub Pages
+
+    一旦 GitHub Pages 认了自定义域名，原来的 <用户名>.github.io/<仓库>/
+    会自动 301 跳到新域名 —— 所以 DNS 没生效就设置，等于把两个地址
+    都弄成打不开。
+    """
+    repo = args.repo or "realchenchenluo/frisbee-radar"
+    out_dir = config.publish.resolve_dir()
+
+    if args.clear:
+        header("解绑自定义域名")
+        result = subprocess.run(
+            ["gh", "api", "-X", "DELETE", f"repos/{repo}/pages", "-f", "cname="],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        cname_file = out_dir / "CNAME"
+        if cname_file.exists():
+            cname_file.unlink()
+            info(f"已删除 {cname_file}")
+        if result.returncode == 0:
+            ok("已解绑，网站回到默认地址")
+            info(f"  https://{repo.split('/')[0]}.github.io/{repo.split('/')[1]}/")
+        else:
+            warn(f"解绑可能没成功：{(result.stderr or result.stdout).strip()[:200]}")
+            info("也可以去仓库 Settings → Pages 手动清除 Custom domain")
+        return 0
+
+    domain = (args.domain or "").strip()
+    if not domain:
+        fail("要指定域名：python run.py domain feipan.info")
+        info("解绑用：python run.py domain --clear")
+        return 2
+
+    header(f"绑定自定义域名：{domain}")
+
+    # ---- 先查 DNS，没配好就别继续 ----
+    info(f"正在检查 {domain} 的解析…")
+    resolved = _dns_cname_targets(domain)
+    owner = repo.split("/")[0]
+    if not resolved:
+        fail(f"{domain} 解析不出任何地址。先去做这一步：")
+        info("")
+        info("  1. 去你的域名商（阿里云/腾讯云/Cloudflare/Namecheap…）的 DNS 设置")
+        info("  2. 加一条记录：")
+        info(f"       类型  CNAME")
+        info(f"       主机记录  @（如果支持；不支持就填 www）")
+        info(f"       记录值    {owner}.github.io")
+        info("  3. 等几分钟到几小时让它生效，再重跑本命令")
+        info("")
+        info("提醒：现在不要跳过这步。GitHub Pages 一旦认了自定义域名，")
+        info("原来的 github.io 地址会跳转到新域名 —— DNS 没生效就设，两边都打不开。")
+        return 1
+
+    ok(f"解析正常：{'、'.join(resolved[:3])}")
+
+    # ---- 写 CNAME 文件并推送（GitHub Pages 认这个文件）----
+    cname_file = out_dir / "CNAME"
+    cname_file.write_text(domain + "\n", encoding="utf-8")
+    info(f"已写入 {cname_file}")
+
+    root = PROJECT_ROOT
+    if _git(root, "rev-parse", "--is-inside-work-tree").returncode == 0:
+        _git(root, "add", str(cname_file.relative_to(root)))
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        _git(root, "commit", "-m", f"绑定自定义域名 {domain}（{stamp}）")
+        push = _git(root, "push", "origin", config.publish.branch)
+        if push.returncode == 0:
+            ok("CNAME 已推送")
+        else:
+            warn(f"推送失败：{(push.stderr or push.stdout).strip()[:200]}")
+
+    # ---- 在 GitHub Pages 上登记域名 ----
+    result = subprocess.run(
+        ["gh", "api", "-X", "PUT", f"repos/{repo}/pages",
+         "-f", f"cname={domain}", "-f", "https_enforced=true"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if result.returncode != 0:
+        warn("通过 API 登记域名没成功，去仓库 Settings → Pages 手动填 Custom domain：")
+        info(f"  https://github.com/{repo}/settings/pages")
+        info(f"  Custom domain 填：{domain}")
+    else:
+        ok("已在 GitHub Pages 登记")
+
+    info("")
+    info("接下来：")
+    info("  1. 等 1~2 分钟，GitHub 会自动签发 HTTPS 证书（首次可能十几分钟）")
+    info(f"  2. 打开 https://{domain}/ 确认")
+    info("  3. 在 Settings → Pages 勾上 Enforce HTTPS（如果还没勾）")
+    info("")
+    info("原来的地址会自动 301 跳到新域名，不用改任何别的东西 ——")
+    info("每天 21:00 的定时任务照常往 GitHub 推，新域名自动跟着更新。")
+    return 0
+
+
 # --------------------------------------------------------------------- daily
 
 
@@ -1116,6 +1269,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_daily.add_argument("--min-relevance", type=float, default=0.5)
     p_daily.add_argument("--db", help="指定数据库文件")
 
+    p_domain = sub.add_parser(
+        "domain",
+        help="给网页绑自定义域名（换掉 github.io 那个地址）",
+        description="把静态站绑到自己的域名上。注意顺序：先在域名商加 DNS 记录，"
+                    "等生效了再跑这个命令 —— 反过来会让网站暂时打不开。",
+    )
+    p_domain.add_argument("domain", nargs="?", help="要绑的域名，如 feipan.info")
+    p_domain.add_argument("--clear", action="store_true", help="解绑，回到 github.io 地址")
+    p_domain.add_argument("--repo", help="GitHub 仓库，默认 realchenchenluo/frisbee-radar")
+
     return parser
 
 
@@ -1154,6 +1317,8 @@ def main(argv: list[str] | None = None) -> int:
             return 130
     if args.command == "publish":
         return do_publish(args, config)
+    if args.command == "domain":
+        return do_domain(args, config)
     if args.command == "daily":
         try:
             return asyncio.run(do_daily(args, config))

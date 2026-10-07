@@ -308,6 +308,71 @@ python run.py probe --platform wechat_channels --keyword 飞盘
 顺带说明：这个计划任务只在**你登录 Windows 时**会跑（桌面工具要浏览器，
 不登录跑没意义）。如果 21:00 电脑是关机/睡眠状态，那次就跳过了，不会补跑。
 
+### 换掉 github.io 那个地址
+
+现在是 `https://realchenchenluo.github.io/frisbee-radar/` —— 这个形状是
+GitHub Pages 的机制决定的（`<用户名>.github.io/<仓库名>`），
+**只要还用 GitHub Pages 的默认域名，用户名就一定会出现在链接里**。
+
+想去掉它，只有两条路。两条都已经在代码里备好了，你决定之后一步就能完成。
+
+#### 路线一：绑自己的域名（最彻底）
+
+链接完全变成你自己的，比如 `https://feipan.info/`。
+
+```bash
+# 1. 先买域名（阿里云/腾讯云/Namecheap 都行，约 ¥30~100/年）
+# 2. 去域名商的 DNS 设置里加一条记录：
+#      类型   CNAME
+#      主机记录  @（不支持 @ 就填 www）
+#      记录值    realchenchenluo.github.io
+# 3. 等几分钟~几小时生效，然后：
+python run.py domain feipan.info
+
+# 想改回去：
+python run.py domain --clear
+```
+
+**顺序不能反，这点很重要。** GitHub Pages 一旦认了自定义域名，原来的
+`github.io` 地址会 301 跳到新域名 —— 所以 DNS 没生效就设置，等于把两个
+地址都弄成打不开，网站直接下线。命令会**先查 DNS**，查不到就拒绝执行并
+把该做的步骤列出来，一个字节都不动。
+
+#### 路线二：换个托管商（免费，链接不含用户名）
+
+Cloudflare Pages / Netlify / Vercel 都给这种形状的免费地址：
+
+```
+https://feipan.pages.dev/        （Cloudflare Pages）
+https://feipan.netlify.app/      （Netlify）
+https://feipan.vercel.app/       （Vercel）
+```
+
+**免费、永久、不含用户名**，而且都能直接从现在的 GitHub 仓库自动部署 ——
+推送到 GitHub 就自动更新，现有的每天 21:00 定时任务完全不用改。
+
+代价是需要你在浏览器里授权一次（用 GitHub 账号登录该服务，约 2 分钟）。
+这一步我替不了，因为它要的是你的账号授权。
+
+以 Cloudflare Pages 为例：
+
+1. 打开 <https://dash.cloudflare.com/> → Workers & Pages → Create → Pages
+2. 选 **Connect to Git** → 授权 GitHub → 选 `frisbee-radar` 仓库
+3. 构建设置：
+   - Framework preset: `None`
+   - Build command: **留空**
+   - Build output directory: `docs`
+4. Save and Deploy。之后每次推送自动更新。
+5. 想要更好记的名字：项目 Settings → 改项目名，链接跟着变
+
+#### 为什么不能直接改
+
+- 改仓库名没用 —— 用户名还在链接里
+- 用 `<用户名>.github.io` 做用户主页站点也没用 —— 还是那个用户名
+- 免费二级域名（`xxx.is-a.dev`、`xxx.eu.org`）倒是免费且不含用户名，
+  但要向它们的仓库提 PR 等维护者审核，通常几天。想走这条我也可以帮你准备
+
+
 ### 首次部署网页
 
 仓库已经建好并推送过了（<https://github.com/realchenchenluo/frisbee-radar>），
