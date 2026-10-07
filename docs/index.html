@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>飞盘讯息聚合</title>
-<meta name="description" content="飞盘讯息聚合 —— 微信公众号、小红书、抖音上飞盘相关的训练技巧与队伍赛事动态，共 198 条，最近更新 2026-10-07 23:16。">
+<meta name="description" content="飞盘讯息聚合 —— 微信公众号、小红书、抖音上飞盘相关的训练技巧与队伍赛事动态，共 197 条，最近更新 2026-10-07 23:20。">
 <style>
 :root {
   --brand: #0C1F1A;
@@ -180,7 +180,7 @@ function render() {
       </div>
       ${it.excerpt ? `<p class="excerpt">${escapeHtml(it.excerpt)}</p>` : ""}
       ${it.linkStatus === "dead"
-          ? `<div class="linkdead">⚠ ${escapeHtml(it.linkNote || "链接已失效")} —— 请用右侧搜索找回原文</div>`
+          ? `<div class="linkdead">⚠ ${escapeHtml(it.linkNote || "链接已失效")}，已为你准备好搜索入口</div>`
             + `<a class="fallback primary" href="${it.fallbackUrl}" target="_blank" rel="noopener noreferrer">按标题搜回原文 →</a>`
           : `<a class="open" href="${it.url}" target="_blank" rel="noopener noreferrer">打开原文 →</a>`
             + (it.fallbackUrl ? `<a class="fallback" href="${it.fallbackUrl}" target="_blank" rel="noopener noreferrer">链接打不开？按标题搜 →</a>` : "")
