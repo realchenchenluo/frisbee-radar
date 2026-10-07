@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>飞盘讯息聚合</title>
-<meta name="description" content="飞盘讯息聚合 —— 微信公众号、小红书、抖音上飞盘相关的训练技巧与队伍赛事动态，共 197 条，最近更新 2026-10-07 22:26。">
+<meta name="description" content="飞盘讯息聚合 —— 微信公众号、小红书、抖音上飞盘相关的训练技巧与队伍赛事动态，共 198 条，最近更新 2026-10-07 22:43。">
 <style>
 :root {
   --brand: #0C1F1A;
@@ -82,6 +82,9 @@ main { padding: 18px 20px 60px; }
 .excerpt { margin: 0 0 9px; color: var(--ink-soft); font-size: 13.5px; }
 .open { font-size: 13px; text-decoration: none; }
 .open:hover { text-decoration: underline; }
+/* 公众号链接会过期（搜狗签名有时间窗），给个搜索兜底入口 */
+.fallback { font-size: 12.5px; color: var(--ink-faint); text-decoration: none; margin-left: 14px; }
+.fallback:hover { color: var(--accent-dark); text-decoration: underline; }
 
 .empty { text-align: center; color: var(--ink-faint); padding: 50px 20px; }
 footer.site {
@@ -167,6 +170,7 @@ function render() {
       </div>
       ${it.excerpt ? `<p class="excerpt">${escapeHtml(it.excerpt)}</p>` : ""}
       <a class="open" href="${it.url}" target="_blank" rel="noopener noreferrer">打开原文 →</a>
+      ${it.fallbackUrl ? `<a class="fallback" href="${it.fallbackUrl}" target="_blank" rel="noopener noreferrer">链接打不开？按标题搜 →</a>` : ""}
     </article>`).join("");
 }
 
