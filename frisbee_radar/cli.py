@@ -618,6 +618,52 @@ def _pages_url(root: Path) -> str:
     return f"https://{owner}.github.io/{repo}/"
 
 
+def _deploy_cloudflare(project: str, out_dir: Path, root: Path) -> bool:
+    """把静态站部署到 Cloudflare Pages。
+
+    走 `npx wrangler pages deploy`（直传模式：本地把文件传上去），
+    不是 Cloudflare 的「Git 集成」（那个要它自己去拉仓库，得在后台点一堆东西）。
+    直传的好处是全程命令行，不用碰后台。
+
+    只在这一步之前已经确认过「内容有变化」时才调用 ——
+    没新内容就不该重新部署，否则会平白多一次部署记录。
+    """
+    info("")
+    info(f"部署到 Cloudflare Pages（项目 {project}）…")
+    try:
+        result = subprocess.run(
+            ["npx", "--yes", "wrangler@latest", "pages", "deploy", str(out_dir),
+             "--project-name", project, "--branch", "main", "--commit-dirty=true"],
+            cwd=str(root), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=600, shell=False,
+        )
+    except FileNotFoundError:
+        warn("找不到 npx —— 需要 Node.js 才能部署 Cloudflare。")
+        info("  浏览器里访问 https://feipannews.pages.dev/ 仍可正常看（上次部署的内容）")
+        return False
+    except subprocess.TimeoutExpired:
+        warn("部署超时（超过 10 分钟），跳过。")
+        return False
+
+    output = (result.stdout or "") + (result.stderr or "")
+    if result.returncode != 0:
+        warn("Cloudflare 部署失败：")
+        for line in output.strip().splitlines()[-6:]:
+            info(f"    {line}")
+        if "not authenticated" in output.lower() or "login" in output.lower():
+            info("")
+            info("看起来是没登录。跑一次：npx wrangler login")
+            info("（会弹浏览器让你授权一次，之后长期有效）")
+        info("")
+        info("GitHub Pages 那份不受影响，仍然是好的。")
+        return False
+
+    ok("Cloudflare 部署完成")
+    info(f"  网页地址：https://{project}.pages.dev/")
+    info("  （1~2 分钟生效；Cloudflare 是直传，不需要等构建）")
+    return True
+
+
 def do_publish(args: argparse.Namespace, config: AppConfig) -> int:
     """把库里的内容生成静态网页；--push 时提交并推送到 GitHub。"""
     db = resolve_db(config, args)
@@ -689,7 +735,9 @@ def do_publish(args: argparse.Namespace, config: AppConfig) -> int:
     rel = out_dir.relative_to(root) if out_dir.is_relative_to(root) else out_dir
     _git(root, "add", str(rel))
     staged = _git(root, "diff", "--cached", "--name-only")
-    if not (staged.stdout or "").strip():
+    content_changed = bool((staged.stdout or "").strip())
+
+    if not content_changed:
         info("网页内容没有变化，跳过提交。")
     else:
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -706,6 +754,14 @@ def do_publish(args: argparse.Namespace, config: AppConfig) -> int:
             return 1
         ok(f"已推送到 origin/{config.publish.branch}")
 
+    # Cloudflare Pages：只在内容真变了才重新部署。
+    # 跟上面「没变化就跳过提交」同一个原则 —— 没新东西就不该产生部署记录。
+    cf_project = config.publish.cloudflare_project
+    if cf_project and content_changed:
+        _deploy_cloudflare(cf_project, out_dir, root)
+    elif cf_project and not content_changed:
+        info("（内容没变，Cloudflare 也不用重新部署）")
+
     info("")
     url = _pages_url(root)
     if url:
@@ -721,10 +777,17 @@ def do_publish(args: argparse.Namespace, config: AppConfig) -> int:
 # -------------------------------------------------------------------- domain
 
 
+# GitHub Pages 的官方 A 记录（主域名必须用 A 记录，不能用 CNAME）
+GITHUB_PAGES_IPS = {
+    "185.199.108.153",
+    "185.199.109.153",
+    "185.199.110.153",
+    "185.199.111.153",
+}
+
 # 域名的形状校验。必须先校验再交给 socket ——
 # 实测 socket.getaddrinfo("") 不报错，而是返回**本机**的地址
-# （172.x / 192.168.x / fe80::…），于是"DNS 查得到"这个判断会被误判成通过，
-# 护栏就失效了。空串、中文、带空格的输入都得在解析前挡掉。
+# （172.x / 192.168.x / fe80::…），于是"DNS 查得到"这个判断会被误判成通过。
 _DOMAIN_RE = re.compile(
     r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
     r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$",
@@ -732,41 +795,95 @@ _DOMAIN_RE = re.compile(
 )
 
 
-def _dns_cname_targets(domain: str) -> list[str]:
-    """查一个域名的解析结果，用来判断 DNS 有没有配好。
+def _resolve_domain(domain: str) -> tuple[list[str], str]:
+    """查域名的解析结果，返回 (地址列表, CNAME 目标)。
 
-    只用标准库（socket / nslookup），不额外引依赖。
-    输入先过格式校验：不是合法域名就直接返回空，不去解析 ——
-    否则空串会解析出本机地址，让调用方误以为 DNS 已就绪。
+    只用标准库，不额外引依赖。**这是唯一碰网络的地方**，
+    判据逻辑放在 _domain_ready_for_pages 里，方便离线测试。
     """
     import socket
 
-    domain = (domain or "").strip().lower()
+    domain = (domain or "").strip().lower().rstrip(".")
     if not _DOMAIN_RE.match(domain):
-        return []
+        return [], ""
 
-    found: list[str] = []
+    addresses: list[str] = []
     try:
         infos = socket.getaddrinfo(domain, None)
-        found = sorted({i[4][0] for i in infos})
+        addresses = sorted({i[4][0] for i in infos})
     except Exception:
-        return []
+        return [], ""
 
-    # 再试着看 CNAME 具体指向哪（nslookup 输出解析，尽力而为）
+    cname = ""
     try:
         result = subprocess.run(
             ["nslookup", "-type=CNAME", domain],
-            capture_output=True, text=True, timeout=15, encoding="utf-8", errors="replace",
+            capture_output=True, text=True, timeout=15,
+            encoding="utf-8", errors="replace",
         )
         for line in (result.stdout or "").splitlines():
-            if "canonical name" in line.lower() or "别名" in line:
+            low = line.lower()
+            if "canonical name" in low or "别名" in line:
                 target = line.split("=")[-1].strip().rstrip(".")
                 if target:
-                    found.append(f"CNAME → {target}")
+                    cname = target.lower()
+                    break
     except Exception:
         pass
 
-    return found
+    return addresses, cname
+
+
+def _domain_ready_for_pages(
+    domain: str, owner: str, *, resolve=None
+) -> tuple[bool, str, str | None]:
+    """判断域名是否已经正确指向 GitHub Pages。
+
+    返回 (是否就绪, 给人看的说明, 错误提示)。
+
+    ⚠️ 判据必须是「指向 GitHub Pages」，而不是「能解析出东西」。
+    实测这台机器的 DNS 在做**域名劫持** —— 路由器对任何不存在的域名
+    （连 nonexistent.invalid 这种保留域名）都返回一个 IP。如果只检查
+    "能不能解析"，那么在劫持 DNS 下任意垃圾域名都会通过检查，
+    然后被当成有效域名设上去 —— 原 github.io 会 301 跳到那个打不开的
+    域名，**网站直接下线**。这正是这道护栏要防的事，所以判据得抗劫持：
+    劫持返回的不可能是 `指向 <owner>.github.io 的 CNAME`，也不会是
+    GitHub Pages 那四个官方 IP。
+
+    根域名不接受 CNAME，得配那 4 条 A 记录；子域一般配 CNAME 到
+    `<owner>.github.io`。两种都认。
+    """
+    resolve = resolve or _resolve_domain
+    domain = (domain or "").strip().lower().rstrip(".")
+    target = f"{owner}.github.io"
+
+    if not domain:
+        return False, "没给域名", "域名是空的"
+    if not _DOMAIN_RE.match(domain):
+        return False, f"{domain} 不像一个合法域名", "格式不对"
+
+    addresses, cname = resolve(domain)
+
+    if cname and cname.rstrip(".").endswith(target):
+        return True, f"{domain} → CNAME → {cname}", None
+
+    pages_ips = sorted(set(addresses) & GITHUB_PAGES_IPS)
+    if pages_ips:
+        return True, f"{domain} → A → {', '.join(pages_ips)}（GitHub Pages 官方 IP）", None
+
+    if addresses or cname:
+        detail = []
+        if cname:
+            detail.append(f"CNAME 指向 {cname}")
+        if addresses:
+            detail.append(f"解析到 {', '.join(addresses[:3])}")
+        return (
+            False,
+            f"{domain} 能解析（{'；'.join(detail)}），但**没指向 GitHub Pages**",
+            None,
+        )
+
+    return False, f"{domain} 解析不出任何地址", None
 
 
 def do_domain(args: argparse.Namespace, config: AppConfig) -> int:
@@ -810,34 +927,49 @@ def do_domain(args: argparse.Namespace, config: AppConfig) -> int:
 
     header(f"绑定自定义域名：{domain}")
 
-    # ---- 先查 DNS，没配好就别继续 ----
-    info(f"正在检查 {domain} 的解析…")
-    resolved = _dns_cname_targets(domain)
+    # ---- 先确认域名真的指向 GitHub Pages，没配好就别继续 ----
     owner = repo.split("/")[0]
-    if not resolved:
-        fail(f"{domain} 解析不出任何地址。先去做这一步：")
+    info(f"正在检查 {domain} 是否已指向 GitHub Pages…")
+    ready, detail, _ = _domain_ready_for_pages(domain, owner)
+    info(f"  {detail}")
+
+    if not ready:
+        fail("DNS 还没配好，已停止 —— 现在设置会让网站直接下线。")
         info("")
         info("  1. 去你的域名商（阿里云/腾讯云/Cloudflare/Namecheap…）的 DNS 设置")
-        info("  2. 加一条记录：")
-        info(f"       类型  CNAME")
-        info(f"       主机记录  @（如果支持；不支持就填 www）")
-        info(f"       记录值    {owner}.github.io")
-        info("  3. 等几分钟到几小时让它生效，再重跑本命令")
+        info("  2. 加记录：")
+        info("       根域名（feipan.info 这种）：")
+        info("         类型 A，主机记录 @，记录值依次填这 4 个：")
+        for ip in sorted(GITHUB_PAGES_IPS):
+            info(f"           {ip}")
+        info("       子域名（www.feipan.info 这种）：")
+        info("         类型 CNAME，主机记录 www，记录值 " + f"{owner}.github.io")
+        info("  3. 等几分钟到几小时生效，再重跑本命令")
         info("")
-        info("提醒：现在不要跳过这步。GitHub Pages 一旦认了自定义域名，")
-        info("原来的 github.io 地址会跳转到新域名 —— DNS 没生效就设，两边都打不开。")
+        info("为什么不能跳过：GitHub Pages 一旦认了自定义域名，原来的 github.io")
+        info("地址会 301 跳到新域名 —— DNS 没生效就设，两个地址都会打不开。")
+        info("")
+        info("（提示：判断依据是「有没有指向 GitHub Pages」，不是「能不能解析」。")
+        info("  有些路由器会对不存在的域名返回一个 IP 做劫持，只看能不能解析会误判。）")
         return 1
 
-    ok(f"解析正常：{'、'.join(resolved[:3])}")
+    ok(f"DNS 就绪：{detail}")
 
     # ---- 写 CNAME 文件并推送（GitHub Pages 认这个文件）----
+    root = PROJECT_ROOT
     cname_file = out_dir / "CNAME"
     cname_file.write_text(domain + "\n", encoding="utf-8")
     info(f"已写入 {cname_file}")
 
-    root = PROJECT_ROOT
     if _git(root, "rev-parse", "--is-inside-work-tree").returncode == 0:
-        _git(root, "add", str(cname_file.relative_to(root)))
+        try:
+            rel_path = cname_file.relative_to(root)
+        except ValueError:
+            # 输出目录被改到仓库外了（测试或自定义配置），那就只写文件不提交
+            warn("输出目录不在仓库里，CNAME 不会提交到 git —— 手动把它放到仓库内再推。")
+            rel_path = None
+        if rel_path is not None:
+            _git(root, "add", str(rel_path))
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         _git(root, "commit", "-m", f"绑定自定义域名 {domain}（{stamp}）")
         push = _git(root, "push", "origin", config.publish.branch)

@@ -131,6 +131,10 @@ class PublishSettings:
     title: str = "飞盘讯息聚合"
     dir: str = "docs"
     branch: str = "main"
+    # Cloudflare Pages 项目名。填了就同时往 Cloudflare 部署一份，
+    # 网址形如 https://<项目名>.pages.dev —— 好处是不含 GitHub 用户名。
+    # 留空则只推 GitHub。
+    cloudflare_project: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "PublishSettings":
@@ -139,6 +143,7 @@ class PublishSettings:
             title=str(data.get("title", "飞盘讯息聚合")),
             dir=str(data.get("dir", "docs")),
             branch=str(data.get("branch", "main")),
+            cloudflare_project=str(data.get("cloudflare_project", "")),
         )
 
     def resolve_dir(self) -> Path:

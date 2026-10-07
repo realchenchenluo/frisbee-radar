@@ -296,6 +296,12 @@ publish:
   dir: docs
   # 推送用的分支
   branch: main
+  # Cloudflare Pages 项目名。填了就额外往 Cloudflare 部署一份，
+  # 网址 https://<项目名>.pages.dev —— 不含 GitHub 用户名，比
+  # realchenchenluo.github.io/frisbee-radar/ 好看。
+  # 留空则只推 GitHub。
+  # 部署走 `npx wrangler pages deploy`，需要先跑过一次 npx wrangler login。
+  cloudflare_project: feipannews
 
 
 # ============================================================
