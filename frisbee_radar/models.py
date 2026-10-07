@@ -69,6 +69,10 @@ class Post:
     # 飞盘相关性 0~1，由 relevance.py 填充
     relevance: float = 0.0
     relevance_hits: list[str] = field(default_factory=list)
+    # 链接可用性：'' 未查 / ok / dead / unknown，由 links.py 填充。
+    # 公众号链接会过期，网页上要据此提示读者。
+    link_status: str = ""
+    link_checked_ts: int | None = None
     # 平台原始返回，排障用；报告里不输出
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -128,6 +132,8 @@ class Post:
             "relevance": self.relevance,
             "relevance_hits": json.dumps(self.relevance_hits, ensure_ascii=False),
             "content_hash": self.content_hash,
+            "link_status": self.link_status,
+            "link_checked_ts": self.link_checked_ts,
             "raw": json.dumps(self.raw, ensure_ascii=False, default=str),
         }
 
@@ -161,6 +167,12 @@ class Post:
             matched_by=row["matched_by"] or "",
             relevance=row["relevance"] or 0.0,
             relevance_hits=_loads(row["relevance_hits"], []),
+            link_status=(
+                row["link_status"] if "link_status" in row.keys() else ""
+            ) or "",
+            link_checked_ts=(
+                row["link_checked_ts"] if "link_checked_ts" in row.keys() else None
+            ),
             raw=_loads(row["raw"], {}),
         )
 

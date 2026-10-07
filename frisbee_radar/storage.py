@@ -46,6 +46,10 @@ CREATE TABLE IF NOT EXISTS posts (
     first_seen_ts   INTEGER,
     -- 首次被写进某份简报的时间。NULL = 还没报送过，watch 据此判断有没有新东西
     reported_ts     INTEGER,
+    -- 链接可用性：'' 未查 / ok / dead / unknown，见 links.py。
+    -- 公众号链接会过期，网页上据此提示读者。
+    link_status     TEXT    DEFAULT '',
+    link_checked_ts INTEGER,
     PRIMARY KEY (platform, post_id)
 );
 
@@ -101,6 +105,8 @@ class Storage:
         additions = {
             "reported_ts": "ALTER TABLE posts ADD COLUMN reported_ts INTEGER",
             "first_seen_ts": "ALTER TABLE posts ADD COLUMN first_seen_ts INTEGER",
+            "link_status": "ALTER TABLE posts ADD COLUMN link_status TEXT DEFAULT ''",
+            "link_checked_ts": "ALTER TABLE posts ADD COLUMN link_checked_ts INTEGER",
         }
         for column, ddl in additions.items():
             if column not in existing:
@@ -349,6 +355,64 @@ class Storage:
             if row and row["ts"]
             else None
         )
+
+    # -------------------------------------------------------- 链接可用性
+
+    def posts_needing_link_check(
+        self, hours: int = 24, platforms: Sequence[str] = ("wechat",), limit: int = 400
+    ) -> list[Post]:
+        """取出需要检查链接的内容。
+
+        只查指定平台（目前只有公众号会过期），并且跳过 `hours` 小时内
+        刚查过的 —— 查得太勤是白打平台，也拖慢每天那一轮。
+
+        `hours <= 0` 表示**强制重查**，不管什么时候查过。
+        这是个显式的「忽略缓存」模式：不能靠「时间戳小于当前时间」来表达，
+        因为时间戳存的是整秒，同一秒内比较不出来，会静默变成「全部跳过」。
+        """
+        marks = ", ".join("?" for _ in platforms)
+        params: list[object] = [*platforms]
+
+        sql = f"""SELECT * FROM posts
+                  WHERE platform IN ({marks}) AND url != ''"""
+        if hours > 0:
+            cutoff = int(
+                (datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp()
+            )
+            sql += " AND (link_checked_ts IS NULL OR link_checked_ts < ?)"
+            params.append(cutoff)
+
+        sql += " ORDER BY COALESCE(collected_ts, 0) DESC LIMIT ?"
+        params.append(limit)
+
+        return [Post.from_row(r) for r in self.conn.execute(sql, params).fetchall()]
+
+    def update_link_status(self, checks: Sequence[object]) -> int:
+        """写入链接检查结果。checks 里每项要有 platform/post_id/status。"""
+        now = int(datetime.now(timezone.utc).timestamp())
+        rows = [
+            (getattr(c, "status", ""), now, getattr(c, "platform", ""),
+             getattr(c, "post_id", ""))
+            for c in checks
+        ]
+        self.conn.executemany(
+            "UPDATE posts SET link_status=?, link_checked_ts=? "
+            "WHERE platform=? AND post_id=?",
+            rows,
+        )
+        self.conn.commit()
+        return len(rows)
+
+    def link_stats(self) -> dict[str, int]:
+        """各状态的链接数量，用于发布时报告。"""
+        out: dict[str, int] = {}
+        for row in self.conn.execute(
+            """SELECT COALESCE(NULLIF(link_status, ''), 'unchecked') AS st,
+                      COUNT(*) AS n
+               FROM posts WHERE url != '' GROUP BY st"""
+        ):
+            out[row["st"]] = row["n"]
+        return out
 
     def author_counts(self, limit: int = 200) -> list[tuple[str, int]]:
         rows = self.conn.execute(

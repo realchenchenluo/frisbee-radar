@@ -361,6 +361,52 @@ class TestFallbackLink(unittest.TestCase):
         self.assertIn("链接打不开", page)
 
 
+class TestLinkNotices(unittest.TestCase):
+    """卡片要如实标注链接的时效性。
+
+    公众号链接是搜狗带签名的跳转地址，实测约 4 小时后还能用、两天后失效。
+    读者得知道要尽早看，否则点进来是空白页。
+    """
+
+    def setUp(self):
+        self.clf = CategoryClassifier([TRAINING, TEAM])
+
+    def _item(self, platform, **over):
+        post = make_post("a", title="飞盘教学课", platform=platform, **over)
+        payload = build_payload([post], self.clf)
+        return payload["items"][0]
+
+    def test_wechat_items_carry_a_time_limit_notice(self):
+        item = self._item("wechat")
+        self.assertTrue(item["linkNote"], "公众号卡片少了时效提示")
+        self.assertIn("时效", item["linkNote"])
+
+    def test_other_platforms_have_no_notice(self):
+        for platform in ("xiaohongshu", "douyin"):
+            with self.subTest(platform=platform):
+                self.assertEqual(self._item(platform)["linkNote"], "")
+
+    def test_unchecked_by_default(self):
+        self.assertEqual(self._item("wechat")["linkStatus"], "unchecked")
+
+    def test_dead_status_flows_into_the_payload(self):
+        item = self._item("wechat", link_status="dead")
+        self.assertEqual(item["linkStatus"], "dead")
+
+    def test_page_renders_dead_notice_and_primary_search_button(self):
+        payload = build_payload([], CategoryClassifier([TRAINING]))
+        page = build_index_html("x", payload)
+        self.assertIn("linkdead", page)
+        self.assertIn("linknote", page)
+        self.assertIn("fallback primary", page)
+
+    def test_dead_wording_does_not_point_to_the_wrong_place(self):
+        """曾经写成「请用右侧搜索」，但按钮在下面 —— 别让文案指向不存在的位置。"""
+        payload = build_payload([], CategoryClassifier([TRAINING]))
+        page = build_index_html("x", payload)
+        self.assertNotIn("请用右侧", page)
+
+
 class TestShippedPublishConfig(unittest.TestCase):
     def test_defaults_point_at_docs(self):
         """GitHub Pages 要指到 /docs，配错了网页就是 404。"""

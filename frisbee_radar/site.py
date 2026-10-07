@@ -56,6 +56,16 @@ from .models import Post, platform_label
 # 摘要截断长度。只发布摘要不发布全文，理由见模块 docstring。
 EXCERPT_LIMIT = 80
 
+# 需要在卡片上提醒「链接有时效」的平台。
+# 公众号的链接是搜狗带签名的跳转地址，实测约 4 小时后还能用、两天后失效 ——
+# 读者要知道得尽早看，否则点进来就是空白。
+LINK_NOTES: dict[str, str] = {
+    "wechat": "公众号链接有时效性，建议尽早打开",
+}
+
+# 链接被判定失效时显示的提示
+LINK_DEAD_HINT = "链接已失效"
+
 # 站点配色。跟 DOCX 日报用的是同一套（FG-1 Forest Mint），保持视觉一致。
 BRAND = "#0C1F1A"
 ACCENT = "#3DDBB5"
@@ -129,6 +139,11 @@ def build_payload(
                 "excerpt": _excerpt(post.content if post.content != post.title else ""),
                 "url": post.url,
                 "fallbackUrl": _fallback_url(post.platform, post.title, post.author),
+                # 链接可用性（由 links.py 检查）。公众号链接会过期，
+                # 网页上据此提示读者「尽早看」以及「已经失效了」。
+                "linkStatus": post.link_status or "unchecked",
+                # 需要提醒「有时效性」的平台
+                "linkNote": LINK_NOTES.get(post.platform, ""),
                 "metric": value,
                 "metricLabel": metric_label,
                 "relevance": round(post.relevance, 2),
@@ -245,9 +260,19 @@ main {{ padding: 18px 20px 60px; }}
 .excerpt {{ margin: 0 0 9px; color: var(--ink-soft); font-size: 13.5px; }}
 .open {{ font-size: 13px; text-decoration: none; }}
 .open:hover {{ text-decoration: underline; }}
-/* 公众号链接会过期（搜狗签名有时间窗），给个搜索兜底入口 */
+/* 公众号链接会过期（搜狗签名有时间窗）。卡片上如实提醒，别让读者点了个空白页 */
+.linknote {{ margin-top: 7px; font-size: 12px; color: #b07d3a; }}
+.linkdead {{
+  margin: 2px 0 8px; font-size: 12.5px; color: #b3453a;
+  background: #fdf3f2; border-left: 3px solid #e0a49d;
+  padding: 6px 10px; border-radius: 3px;
+}}
 .fallback {{ font-size: 12.5px; color: var(--ink-faint); text-decoration: none; margin-left: 14px; }}
 .fallback:hover {{ color: var(--accent-dark); text-decoration: underline; }}
+/* 链接失效时，搜索入口变成主要动作，不缩在角落 */
+.fallback.primary {{
+  margin-left: 0; font-size: 13px; color: var(--accent-dark); font-weight: 500;
+}}
 
 .empty {{ text-align: center; color: var(--ink-faint); padding: 50px 20px; }}
 footer.site {{
@@ -332,8 +357,13 @@ function render() {{
         ${{it.metric ? `<span>${{it.metricLabel}} ${{fmt(it.metric)}}</span>` : ""}}
       </div>
       ${{it.excerpt ? `<p class="excerpt">${{escapeHtml(it.excerpt)}}</p>` : ""}}
-      <a class="open" href="${{it.url}}" target="_blank" rel="noopener noreferrer">打开原文 →</a>
-      ${{it.fallbackUrl ? `<a class="fallback" href="${{it.fallbackUrl}}" target="_blank" rel="noopener noreferrer">链接打不开？按标题搜 →</a>` : ""}}
+      ${{it.linkStatus === "dead"
+          ? `<div class="linkdead">⚠ ${{escapeHtml(it.linkNote || "链接已失效")}}，已为你准备好搜索入口</div>`
+            + `<a class="fallback primary" href="${{it.fallbackUrl}}" target="_blank" rel="noopener noreferrer">按标题搜回原文 →</a>`
+          : `<a class="open" href="${{it.url}}" target="_blank" rel="noopener noreferrer">打开原文 →</a>`
+            + (it.fallbackUrl ? `<a class="fallback" href="${{it.fallbackUrl}}" target="_blank" rel="noopener noreferrer">链接打不开？按标题搜 →</a>` : "")
+            + (it.linkNote ? `<div class="linknote">${{escapeHtml(it.linkNote)}}</div>` : "")
+      }}
     </article>`).join("");
 }}
 

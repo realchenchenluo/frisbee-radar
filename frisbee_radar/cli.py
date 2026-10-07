@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -32,6 +33,7 @@ from .browser import (
 from .categories import CategoryClassifier
 from .config import PROJECT_ROOT, AppConfig, load_config
 from .docx_report import build_docx_daily
+from .links import STATUS_DEAD, STATUS_OK, STATUS_UNKNOWN, check_links
 from .models import Post, platform_label
 from .relevance import RelevanceScorer
 from .report import ReportBuilder
@@ -696,6 +698,53 @@ def do_publish(args: argparse.Namespace, config: AppConfig) -> int:
             warn("库里没有可发布的内容。")
             return 1
         info(f"从库里读到 {len(posts)} 条相关内容")
+
+        # ---- 用当前的关键词配置重新打分 ----
+        # 相关性是**采集时**算好存进库的，所以光改 keywords.yaml 不会影响
+        # 已有数据。发布前重算一遍，改词表就能立刻生效，不用重采。
+        # （收益很实在：今天实测撞到一篇奇门遁甲文章讲「鸣法飞盘」，
+        #   往 negative 里加个词，重跑发布就没了。）
+        scorer = RelevanceScorer(config.keywords)
+        rescored = 0
+        for post in posts:
+            result = scorer.score(post.title, post.content)
+            if abs(result.score - post.relevance) > 1e-9:
+                rescored += 1
+            post.relevance = result.score
+            post.relevance_hits = result.hits
+        if rescored:
+            info(f"按当前词表重新打分：{rescored} 条分数有变化")
+            storage.conn.executemany(
+                "UPDATE posts SET relevance=?, relevance_hits=? "
+                "WHERE platform=? AND post_id=?",
+                [(p.relevance, json.dumps(p.relevance_hits, ensure_ascii=False),
+                  p.platform, p.post_id) for p in posts],
+            )
+            storage.conn.commit()
+
+        # ---- 链接可用性检查 ----
+        # 公众号链接会过期（搜狗签名有时间窗），网页上要如实标注，
+        # 所以发布前先查一遍。结果按链接缓存，24 小时内查过的不重复查。
+        if not args.skip_link_check:
+            pending = storage.posts_needing_link_check(hours=24)
+            if pending:
+                info("")
+                info(f"检查 {len(pending)} 条公众号链接是否还有效…")
+                checks = asyncio.run(check_links(pending))
+                storage.update_link_status(checks)
+                counts = Counter(c.status for c in checks)
+                ok_n, dead_n = counts.get(STATUS_OK, 0), counts.get(STATUS_DEAD, 0)
+                info(f"  有效 {ok_n} 条　已失效 {dead_n} 条　"
+                     f"无法判定 {counts.get(STATUS_UNKNOWN, 0)} 条")
+                if dead_n:
+                    warn(f"有 {dead_n} 条链接已失效，网页上会标注并给出搜索兜底")
+                # ⚠️ 必须重新读一遍。上面那批 posts 是检查之前查的，
+                # 内存对象里还是旧的 link_status —— 不重读的话
+                # 生成出来的网页会全是 unchecked，这个功能等于没做。
+                posts = storage.query(min_relevance=0.5, limit=20000)
+            else:
+                info("（链接都在 24 小时内查过，跳过）")
+
         site_info = generate_site(
             posts, out_dir, config.build_classifier(),
             title=config.publish.title,
@@ -1076,7 +1125,7 @@ async def do_daily(args: argparse.Namespace, config: AppConfig) -> int:
     #    只要库里有新内容，网页也该更新。
     info("")
     publish_args = argparse.Namespace(
-        out=None, push=args.push, if_changed=True, db=args.db,
+        out=None, push=args.push, if_changed=True, skip_link_check=False, db=args.db,
     )
     publish_code = do_publish(publish_args, config)
 
@@ -1423,6 +1472,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_publish.add_argument("--if-changed", action="store_true",
                           help="内容没变就什么都不做（定时任务用这个，"
                                "避免没新内容也刷新一遍）")
+    p_publish.add_argument("--skip-link-check", action="store_true",
+                          help="跳过链接可用性检查（公众号链接会过期，默认会查）")
     p_publish.add_argument("--db", help="指定数据库文件")
 
     p_daily = sub.add_parser(
